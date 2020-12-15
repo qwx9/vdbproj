@@ -392,15 +392,16 @@ ggsave("plots/cormap.pdf", cormap, width=12, height=10)
 
 Finally, we can perform a simple PCA to evaluate if there is any grouping structure in the data.
 
-```{r, out.width='\\textwidth', fig.height=6, fig.align='center'}
+```{r}
 # compute pca on numeric matrix, scale the variables to unit variance as recommended
 pca <- prcomp(otumat, scale=TRUE)
 # percent of variance explained by each axis
 pca$sdev ^ 2 / sum(pca$sdev ^ 2)
 # 40.6% and 28.6% for PC1 and PC2
+```
 
-# render base graphics plot as pdf
 ```{r, out.width='\\textwidth', fig.height=6, fig.align='center'}
+# render base graphics plot
 biplot(pca,
 	# draw arrows for each eigenvector
 	var.axes=TRUE,
