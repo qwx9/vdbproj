@@ -80,7 +80,7 @@ otumat <- otu %>%
 str(otumat)
 ```
 
-Next, we'll need a the summed counts by taxon across OTUs,
+Next, we'll need the summed counts by taxon across OTUs,
 and get the top 19 taxons in terms of abundance.
 The very first element is actually _unclassified_,
 the unassigned OTUs, and we'll discard it.
