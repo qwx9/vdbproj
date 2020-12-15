@@ -1,0 +1,422 @@
+---
+title: "Microbial Biogeography of Restroom Surfaces"
+author: "Thibaut Thalamas, Konstantinn Bonnet"
+date: "12/15/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+Load packages.
+
+```{r, results='hide'}
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggdendro)
+library(RColorBrewer)
+```
+
+Set a general _ggplot2_ theme to use throughout.
+
+```{r}
+th <- theme_classic() +
+	theme(panel.grid.major=element_line(size=0.5, linetype="solid", colour="#eeeeee"),
+	panel.grid.minor=element_line(size=0.25, linetype="solid", colour="#eeeeee"))
+theme_set(th)
+```
+
+## Read data and prepare data
+
+Read the OTU table and cast counts to numeric,
+since cor() and others require numeric data.
+
+```{r}
+# read otu table and cast counts to numeric, cor() and others require numeric data
+otu <- read.delim("1335.vdb.tab", header=TRUE) %>%
+	mutate_if(is.integer, as.numeric)
+str(otu)
+```
+
+### Preliminary analysis and data manipulation
+
+First, get the names of phyla and taxa by splitting the _OTUConTaxonomy_ column,
+containing the assigned taxonomy for each OTU.
+
+```{r}
+# for each row of the otu table
+tax <- apply(otu, 1, function(x)
+	# select OTUConTaxonomy column
+	x[2] %>%
+		# split strings and get the result, returned inside a list
+		strsplit(";") %>%
+		# subset the list
+		"[["(1) %>%
+		# remove assignment score from the name
+		sub(pattern="\\(.*", replacement="")
+)
+# transpose so OTUs are again the rows
+tax <- t(tax)
+str(tax)
+# bind the new phylum and taxon column to the original table
+otu <- cbind(otu, data.frame(Genus=tax[,2], Taxon=tax[,6]))
+str(otu)
+```
+
+For analysis further on, extract the only the counts from the table,
+and convert to a matrix: handy for some of the computations.
+
+```{r}
+otumat <- otu %>%
+	# the counts are the only numeric columns
+	select_if(is.numeric) %>%
+	as.matrix
+str(otumat)
+```
+
+Next, we'll need a the summed counts by taxon across OTUs,
+and get the top 19 taxons in terms of abundance.
+The very first element is actually _unclassified_,
+the unassigned OTUs, and we'll discard it.
+
+```{r}
+# this same construct will be used later:
+# take the numeric count matrix
+taxtotals <- otumat %>%
+	# for each of its columns (sites)
+	apply(2, function(x)
+		# for each unique taxon (rows)
+		sapply(unique(otu$Taxon), function(t)
+			# sum its abundance
+			sum(x[otu$Taxon == t])
+		)
+	# this returns total abundance per taxon per site
+	) %>%
+	# sum abundance across sites => table with total abundance per taxon
+	apply(1, sum)
+str(taxtotals)
+# order taxons by descending abundance
+taxtotals <- taxtotals[order(-taxtotals)]
+# then extract the top 19 taxons (removing unclassified)
+toptax <- taxtotals[2:20]
+toptax
+```
+
+
+## Phylum composition by site
+
+We'll first expore phylum composition by site.
+Using the previous manipulations,
+we'll first compute a slightly prettier color palette for each phylum,
+then output a stacked percent barchart,
+showing relative proportion of each phylum in each site.
+
+### Color palette
+
+Here, we use ColorBrewer palettes for good constracts and for categorical data,
+since those sets have the most colors.
+We have more phylum (18) than colors in the set (12),
+so we'll interpolate some additional colors.
+
+```{r}
+# number of unique phylum, the number of colors needed
+ngenus <- length(unique(otu$Genus))
+# extract the colors of the Set1 brewer color palette
+# this gives a harmless warning since we request too many colors
+pal.g <- brewer.pal(ngenus, "Set1")
+# interpolate for the remaining elements
+# colorRampPalette returns a function which we use directly to extract our colors
+cmap.g <- colorRampPalette(pal.g, bias=1, interpolate="spline")(ngenus)
+cmap.g
+```
+
+### Plot
+
+We have to transform our OTU table into long format for use with _ggplot2_.
+Since we don't reuse this result, we'll just pipe it directly to _ggplot()_.
+
+Finally, we save the _ggplot_ object to a png file.
+Rendering to pdf had different results on various machines,
+as could possibly be seen in this document.
+
+```{r, out.width='\\textwidth', fig.height=6, fig.align='center'}
+# stacked percent barchart
+bar.g <- otu %>%
+	# get count columns and pivot to long format (similar to melt in reshape2)
+	# tidyverse matches() is used to select the columns via a regex
+	# site column will contains the sample site, and abundance the abundance values
+	pivot_longer(cols=matches("^[a-z]", ignore.case=FALSE), names_to="site", values_to="abundance") %>%
+	# x=site, y=abundance and use phylum as group colors for the bar's fill
+	ggplot(aes(site, abundance, fill=Genus)) +
+		# output percent stacked barchart
+		geom_bar(position="fill", stat="identity") +
+		# rotate xlab and remove x title
+		theme(axis.text.x=element_text(angle=45, vjust=1, size=12, hjust=1),
+			axis.title=element_blank()) +
+		# manually set the colors for each phylum from the palette
+		scale_fill_manual(values=cmap.g[order(unique(otu$Genus))])
+bar.g
+# save it
+ggsave("plots/stacked.genus.by.site.png", bar.g, width=12, height=10)
+```
+
+## Taxonomic composition by site
+
+Next, we'll do the same, but this time for taxa.
+These are more precise and familiar and can provide interesting results.
+
+To make a prettier and more informative plot,
+there are several complicated steps involved.
+
+To easily view which phylum the taxa belong to,
+we'd like to group them visually.
+An intuitive way to do this is to make gradients of one color for each phylum,
+since there are no more than a few of them,
+and the taxa are few enough that there still will be enough contrast to distinguish each of them.
+
+To this end, we need to create the color palette manually for each,
+but in a scriptable and extensible way.
+
+### Creating the color palettes
+
+We'll have to build a correspondence table
+with the top 19 taxa found earlier.
+
+First, we extract the phylum and taxon columns from the taxonomy table computed earlier.
+
+```{r}
+# filter the taxonomy table by the names of the top taxa, get phylum (2) and taxon (6) columns
+corr <- tax[tax[,6] %in% names(toptax),][,c(2,6)]
+# only take unique rows, then convert to data frame and set appropriate column names
+corr <- unique(corr) %>%
+	as.data.frame %>%
+	# "family" seems more appropriate than "genus" here
+	rename(Family=V1, Taxon=V2)
+corr
+```
+
+Next, we use ordered factors to force ordering by phylum, then taxon.
+This is necessary to preserve this order later since we further manipulate the tables,
+and have to make sure colors are correctly attributed.
+
+```{r}
+# take our correspondence table
+corr <- corr %>%
+	# convert the family column to an ordered factor according to abundance and importance
+	# the levels are from what was obtained above
+	mutate(Family=factor(Family,
+		levels=c("Proteobacteria", "Actinobacteria", "Firmicutes", "Bacteroidetes"),
+		ordered=TRUE)) %>%
+	# sort by family then taxon
+	arrange(Family, Taxon) %>%
+	# now freeze the new taxon order
+	mutate(Taxon=factor(Taxon, levels=unique(Taxon), ordered=TRUE))
+corr
+```
+
+Finally, we can attribute color gradients for each phylum,
+making sure each gets a different base color.
+
+```{r}
+# add a new column with the colors for the ordering
+corr$col <- c(
+	# blue, red, green and violet/pink gradients
+	# like before, we directly call the function returned with the appropriate number of colors we need
+	colorRampPalette(c("lightblue", "darkblue"))(8),
+	colorRampPalette(c("#ffff66", "red", "darkred"))(5),
+	colorRampPalette(c("lightgreen", "darkgreen"))(4),
+	colorRampPalette(c("violet", "blue"))(8)[1:2]
+)
+corr
+```
+
+### Stacked percent barchart
+
+We can now output the final plot using the colors we computed,
+the same way as before.
+
+```{r, out.width='\\textwidth', fig.height=6, fig.align='center'}
+bar.t <- otu %>%
+	# remove columns we don't care about
+	select(-Genus, -starts_with("OTU")) %>%
+	# extract rows for only top taxa
+	filter(Taxon %in% names(toptax)) %>%
+	# convert to long format for ggplot as before
+	pivot_longer(cols=matches("^[a-t]", ignore.case=FALSE), names_to="site", values_to="abundance") %>%
+	# convert to ordered factor as with the correspondence table, using its order
+	# counterintuitive and timeconsuming to figure out, but very important to avoid any discrepancies...
+	mutate(Taxon=factor(Taxon, levels=levels(corr$Taxon), ordered=TRUE)) %>%
+	ggplot(aes(site, abundance, fill=Taxon)) +
+		# stacked percent barchart
+		geom_bar(position="fill", stat="identity") +
+		# set our colors
+		scale_fill_manual(values=corr$col) +
+		# rotate x legend, remove x axis label
+		theme(axis.text.x=element_text(angle=45, vjust=1, size=12, hjust=1),
+			axis.title=element_blank())
+bar.t
+# save the plot
+ggsave("plots/stacked.taxon.by.site.png", bar.t, width=12, height=10)
+```
+
+## Phylum correlation map
+
+It is of interest to evaluate links between phylum in our data.
+This can be done by computing the correlation between phylum,
+then visualizing it as a sort of heatmap.
+
+### Preparing the data
+
+We first need to extract the totals for each phylum by site,
+since that's what we'll be calculating the correlation matrix on.
+
+```{r}
+# use the abundance matrix computed at the beginning, cor() needs numerics
+gentotals <- otumat %>%
+	# for each site (column)
+        apply(2, function(x)
+		# for each OTU (row),
+		# sum abundances of OTUs assigned to each individual phylum
+                sapply(unique(otu$Genus), function(g)
+                        sum(x[otu$Genus == g])
+                )
+        )
+head(gentotals)
+```
+
+There is a high number of OTUs with single counts across sites,
+and many unassigned ones.
+Similarly, there are phylums with only a few corresponding rows,
+and very low counts.
+We could still compute a correlation with the rest,
+but it would be difficult to interpret.
+We set the threshold as low as possible.
+Two phylum are removed.
+
+```{r}
+# calculate a frequency table 
+genfreq <- table(otu$Genus)
+genfreq
+# filter the most infrequent phylum
+gentotals <- gentotals[!rownames(gentotals) %in% names(genfreq)[genfreq < 5],]
+head(gentotals)
+```
+
+### Computing correlation and ordering
+
+We'll first compute an ordinary correlation matrix between phylum,
+which are the rows of the total abundance matrix.
+
+```{r}
+gencor <- cor(t(gentotals))
+```
+
+Next, we'd like to group highly correlated phylum together.
+An easy way is to perform hierarchical clustering and use the clustering's order.
+We even get a dendrogram for easier visualization that way.
+
+For this kind of data, Pearson distance, defined as 1 - Pearson correlation is appropriate,
+and Ward linkage method works very well.
+As indicated in the manual, _ward.D2_ must be used, since our distances are not squared (or positive integers).
+
+```{r}
+# perform the clustering
+hcl <- hclust(as.dist(1 - gencor), method="ward.D2")
+# extract order
+horder <- rownames(gentotals)[hcl$order]
+horder
+# convert to data appropriate for ggplot2, which gives us segment coordinates for drawing it directly on top
+dhcl <- dendro_data(hcl)
+# reorder the matrix
+gencor <- gencor[horder,horder]
+gencor
+```
+
+We then remove redundant data by removing the top triangle of the matrix.
+
+```{r}
+# lower.tri selects the matrix' lower triangle, and we just remove all the data
+gencor[lower.tri(gencor)] <- NA
+```
+
+## Correlation map
+
+We can now output a correlation map similar similar to a heatmap.
+Colors are set as white for no correlation and red and blue for positive and negative correlation respectively.
+We add the dendrogram obtained before above it.
+
+```{r, out.width='\\textwidth', fig.height=6, fig.align='center'}
+# use the ordered correlation matrix
+cormap <- gencor %>%
+	# convert to dataframe for ggplot
+	as.data.frame %>%
+	# get the rownames to use for grouping
+	rownames_to_column("grp") %>%
+	# convert to long format, remove missing values (upper triangle)
+	pivot_longer(-grp, names_to="key", values_to="v", values_drop_na=TRUE) %>%
+	# make sure the order is preserved like before, otherwise elements may be shifted seemingly at random
+	mutate(grp=factor(grp, levels=horder, ordered=TRUE),
+		key=factor(key, levels=horder, ordered=TRUE)) %>%
+	# pass it directly to ggplot; label will be the rounded correlation value within each cell
+	ggplot(aes(key, grp, fill=v, label=round(v,2))) +
+			# tilemap background
+			geom_tile(color="white") +
+			# set a blue to red gradient for [-1;1] correlation values
+			scale_fill_gradient2(
+				low="blue", high="red", mid="white",
+				midpoint=0,
+				limit=c(-1,1), space="Lab",
+				name="Pearson\nCorrelation") +
+			# rotate x axis for easier viewing, remove axis title
+			theme(axis.text.x=element_text(angle=45, vjust=1, size=12, hjust=1),
+				axis.title=element_blank()) +
+			# make sure we get a square matrix
+			coord_fixed() +
+			# add correlation values
+			geom_text(color="black", size=3.5) +
+			# draw the dendrogram; we offset y coordinates to place it above the tilemap
+			geom_segment(data=segment(dhcl), aes(x, y+nrow(gencor)+0.5, xend=xend, yend=yend+nrow(gencor)+0.5), inherit.aes=FALSE)
+cormap
+# save it
+ggsave("plots/cormap.pdf", cormap, width=12, height=10)
+```
+
+
+## Principal component analysis
+
+Finally, we can perform a simple PCA to evaluate if there is any grouping structure in the data.
+
+```{r, out.width='\\textwidth', fig.height=6, fig.align='center'}
+# compute pca on numeric matrix, scale the variables to unit variance as recommended
+pca <- prcomp(otumat, scale=TRUE)
+# percent of variance explained by each axis
+pca$sdev ^ 2 / sum(pca$sdev ^ 2)
+# 40.6% and 28.6% for PC1 and PC2
+
+# render base graphics plot as pdf
+```{r, out.width='\\textwidth', fig.height=6, fig.align='center'}
+biplot(pca,
+	# draw arrows for each eigenvector
+	var.axes=TRUE,
+	xlabs=rep("*", nrow(otumat)), cex=c(0.9,1.1),
+	xlim=c(-0.9,0.2), expand=50,
+	col=c("black", "#dd0000"))
+```
+
+```{r, results='hide'}
+pdf("plots/pca.pdf", 12, 10)
+# plot the pca
+biplot(pca,
+	# draw arrows for each eigenvector
+	var.axes=TRUE,
+	xlabs=rep("*", nrow(otumat)), cex=c(0.9,1.1),
+	xlim=c(-0.9,0.2), expand=50,
+	col=c("black", "#dd0000"))
+dev.off()
+```
